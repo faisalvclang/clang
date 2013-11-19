@@ -445,7 +445,7 @@ void StmtPrinter::VisitMSAsmStmt(MSAsmStmt *Node) {
   Indent() << "__asm ";
   if (Node->hasBraces())
     OS << "{\n";
-  OS << *(Node->getAsmString()) << "\n";
+  OS << Node->getAsmString() << "\n";
   if (Node->hasBraces())
     Indent() << "}\n";
 }
@@ -580,6 +580,87 @@ void StmtPrinter::VisitSEHFinallyStmt(SEHFinallyStmt *Node) {
 }
 
 //===----------------------------------------------------------------------===//
+//  OpenMP clauses printing methods
+//===----------------------------------------------------------------------===//
+
+namespace {
+class OMPClausePrinter : public OMPClauseVisitor<OMPClausePrinter> {
+  raw_ostream &OS;
+  /// \brief Process clauses with list of variables.
+  template <typename T>
+  void VisitOMPClauseList(T *Node, char StartSym);
+public:
+  OMPClausePrinter(raw_ostream &OS) : OS(OS) { }
+#define OPENMP_CLAUSE(Name, Class)                              \
+  void Visit##Class(Class *S);
+#include "clang/Basic/OpenMPKinds.def"
+};
+
+void OMPClausePrinter::VisitOMPDefaultClause(OMPDefaultClause *Node) {
+  OS << "default("
+     << getOpenMPSimpleClauseTypeName(OMPC_default, Node->getDefaultKind())
+     << ")";
+}
+
+template<typename T>
+void OMPClausePrinter::VisitOMPClauseList(T *Node, char StartSym) {
+  for (typename T::varlist_iterator I = Node->varlist_begin(),
+                                    E = Node->varlist_end();
+         I != E; ++I)
+    OS << (I == Node->varlist_begin() ? StartSym : ',')
+       << *cast<NamedDecl>(cast<DeclRefExpr>(*I)->getDecl());
+}
+
+void OMPClausePrinter::VisitOMPPrivateClause(OMPPrivateClause *Node) {
+  if (!Node->varlist_empty()) {
+    OS << "private";
+    VisitOMPClauseList(Node, '(');
+    OS << ")";
+  }
+}
+
+void OMPClausePrinter::VisitOMPFirstprivateClause(OMPFirstprivateClause *Node) {
+  if (!Node->varlist_empty()) {
+    OS << "firstprivate";
+    VisitOMPClauseList(Node, '(');
+    OS << ")";
+  }
+}
+
+void OMPClausePrinter::VisitOMPSharedClause(OMPSharedClause *Node) {
+  if (!Node->varlist_empty()) {
+    OS << "shared";
+    VisitOMPClauseList(Node, '(');
+    OS << ")";
+  }
+}
+
+}
+
+//===----------------------------------------------------------------------===//
+//  OpenMP directives printing methods
+//===----------------------------------------------------------------------===//
+
+void StmtPrinter::VisitOMPParallelDirective(OMPParallelDirective *Node) {
+  Indent() << "#pragma omp parallel ";
+
+  OMPClausePrinter Printer(OS);
+  ArrayRef<OMPClause *> Clauses = Node->clauses();
+  for (ArrayRef<OMPClause *>::iterator I = Clauses.begin(), E = Clauses.end();
+       I != E; ++I)
+    if (*I && !(*I)->isImplicit()) {
+      Printer.Visit(*I);
+      OS << ' ';
+    }
+  OS << "\n";
+  if (Node->getAssociatedStmt()) {
+    assert(isa<CapturedStmt>(Node->getAssociatedStmt()) &&
+           "Expected captured statement!");
+    Stmt *CS = cast<CapturedStmt>(Node->getAssociatedStmt())->getCapturedStmt();
+    PrintStmt(CS);
+  }
+}
+//===----------------------------------------------------------------------===//
 //  Expr printing methods.
 //===----------------------------------------------------------------------===//
 
@@ -656,6 +737,9 @@ void StmtPrinter::VisitPredefinedExpr(PredefinedExpr *Node) {
       break;
     case PredefinedExpr::Function:
       OS << "__FUNCTION__";
+      break;
+    case PredefinedExpr::FuncDName:
+      OS << "__FUNCDNAME__";
       break;
     case PredefinedExpr::LFunction:
       OS << "L__FUNCTION__";
@@ -1019,6 +1103,14 @@ void StmtPrinter::VisitShuffleVectorExpr(ShuffleVectorExpr *Node) {
   OS << ")";
 }
 
+void StmtPrinter::VisitConvertVectorExpr(ConvertVectorExpr *Node) {
+  OS << "__builtin_convertvector(";
+  PrintExpr(Node->getSrcExpr());
+  OS << ", ";
+  Node->getType().print(OS, Policy);
+  OS << ")";
+}
+
 void StmtPrinter::VisitInitListExpr(InitListExpr* Node) {
   if (Node->getSyntacticForm()) {
     Visit(Node->getSyntacticForm());
@@ -1113,24 +1205,25 @@ void StmtPrinter::VisitAtomicExpr(AtomicExpr *Node) {
 
   // AtomicExpr stores its subexpressions in a permuted order.
   PrintExpr(Node->getPtr());
-  OS << ", ";
   if (Node->getOp() != AtomicExpr::AO__c11_atomic_load &&
       Node->getOp() != AtomicExpr::AO__atomic_load_n) {
-    PrintExpr(Node->getVal1());
     OS << ", ";
+    PrintExpr(Node->getVal1());
   }
   if (Node->getOp() == AtomicExpr::AO__atomic_exchange ||
       Node->isCmpXChg()) {
-    PrintExpr(Node->getVal2());
     OS << ", ";
+    PrintExpr(Node->getVal2());
   }
   if (Node->getOp() == AtomicExpr::AO__atomic_compare_exchange ||
       Node->getOp() == AtomicExpr::AO__atomic_compare_exchange_n) {
-    PrintExpr(Node->getWeak());
     OS << ", ";
+    PrintExpr(Node->getWeak());
   }
-  if (Node->getOp() != AtomicExpr::AO__c11_atomic_init)
+  if (Node->getOp() != AtomicExpr::AO__c11_atomic_init) {
+    OS << ", ";
     PrintExpr(Node->getOrder());
+  }
   if (Node->isCmpXChg()) {
     OS << ", ";
     PrintExpr(Node->getOrderFail());
@@ -1225,7 +1318,7 @@ void StmtPrinter::VisitCXXConstCastExpr(CXXConstCastExpr *Node) {
 void StmtPrinter::VisitCXXTypeidExpr(CXXTypeidExpr *Node) {
   OS << "typeid(";
   if (Node->isTypeOperand()) {
-    Node->getTypeOperand().print(OS, Policy);
+    Node->getTypeOperandSourceInfo()->getType().print(OS, Policy);
   } else {
     PrintExpr(Node->getExprOperand());
   }
@@ -1235,7 +1328,7 @@ void StmtPrinter::VisitCXXTypeidExpr(CXXTypeidExpr *Node) {
 void StmtPrinter::VisitCXXUuidofExpr(CXXUuidofExpr *Node) {
   OS << "__uuidof(";
   if (Node->isTypeOperand()) {
-    Node->getTypeOperand().print(OS, Policy);
+    Node->getTypeOperandSourceInfo()->getType().print(OS, Policy);
   } else {
     PrintExpr(Node->getExprOperand());
   }
@@ -1338,6 +1431,8 @@ void StmtPrinter::VisitCXXTemporaryObjectExpr(CXXTemporaryObjectExpr *Node) {
   for (CXXTemporaryObjectExpr::arg_iterator Arg = Node->arg_begin(),
                                          ArgEnd = Node->arg_end();
        Arg != ArgEnd; ++Arg) {
+    if (Arg->isDefaultArgument())
+      break;
     if (Arg != Node->arg_begin())
       OS << ", ";
     PrintExpr(*Arg);
@@ -1376,17 +1471,18 @@ void StmtPrinter::VisitLambdaExpr(LambdaExpr *Node) {
       break;
 
     case LCK_ByRef:
-      if (Node->getCaptureDefault() != LCD_ByRef)
+      if (Node->getCaptureDefault() != LCD_ByRef || C->isInitCapture())
         OS << '&';
       OS << C->getCapturedVar()->getName();
       break;
 
     case LCK_ByCopy:
-      if (Node->getCaptureDefault() != LCD_ByCopy)
-        OS << '=';
       OS << C->getCapturedVar()->getName();
       break;
     }
+
+    if (C->isInitCapture())
+      PrintExpr(C->getCapturedVar()->getInit());
   }
   OS << ']';
 
@@ -1524,6 +1620,10 @@ void StmtPrinter::VisitCXXConstructExpr(CXXConstructExpr *E) {
     OS << " }";
 }
 
+void StmtPrinter::VisitCXXStdInitializerListExpr(CXXStdInitializerListExpr *E) {
+  PrintExpr(E->getSubExpr());
+}
+
 void StmtPrinter::VisitExprWithCleanups(ExprWithCleanups *E) {
   // Just forward to the sub expression.
   PrintExpr(E->getSubExpr());
@@ -1615,6 +1715,7 @@ static const char *getTypeTraitName(UnaryTypeTrait UTT) {
   case UTT_IsReference:             return "__is_reference";
   case UTT_IsRvalueReference:       return "__is_rvalue_reference";
   case UTT_IsScalar:                return "__is_scalar";
+  case UTT_IsSealed:                return "__is_sealed";
   case UTT_IsSigned:                return "__is_signed";
   case UTT_IsStandardLayout:        return "__is_standard_layout";
   case UTT_IsTrivial:               return "__is_trivial";
@@ -1885,7 +1986,7 @@ void StmtPrinter::VisitAsTypeExpr(AsTypeExpr *Node) {
 // Stmt method implementations
 //===----------------------------------------------------------------------===//
 
-void Stmt::dumpPretty(ASTContext &Context) const {
+void Stmt::dumpPretty(const ASTContext &Context) const {
   printPretty(llvm::errs(), 0, PrintingPolicy(Context.getLangOpts()));
 }
 

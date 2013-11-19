@@ -87,10 +87,6 @@ struct V {
       /**/;
 #ifndef CXX1Y
     // expected-error@-3 {{statement not allowed in constexpr constructor}}
-#else
-    // FIXME: Once we support evaluating a for-statement, this diagnostic should disappear.
-    // expected-error@-7 {{never produces a constant expression}}
-    // expected-note@-7 {{subexpression}}
 #endif
   }
   constexpr V(int(&)[2]) {
@@ -317,4 +313,24 @@ namespace CtorLookup {
   };
   constexpr C::C(const C&) = default;
   constexpr C::C(C&) = default; // expected-error {{not constexpr}}
+}
+
+namespace PR14503 {
+  template<typename> struct V {
+    union {
+      int n;
+      struct {
+        int x,
+            y;
+      };
+    };
+    constexpr V() : x(0) {}
+  };
+
+  // The constructor is still 'constexpr' here, but the result is not intended
+  // to be a constant expression. The standard is not clear on how this should
+  // work.
+  constexpr V<int> v; // expected-error {{constant expression}} expected-note {{subobject of type 'int' is not initialized}}
+
+  constexpr int k = V<int>().x; // FIXME: ok?
 }
